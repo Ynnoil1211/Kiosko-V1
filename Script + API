@@ -1,0 +1,248 @@
+// --- CONFIGURACIÓN ---
+const API_TOKEN = "CANTON2026"; 
+const HOJA_CONFIG = "Config";
+const HOJA_REGISTROS = "Registros";
+const HOJA_NOMINA = "Nomina_Diaria";
+
+/**
+ * 1. ENDPOINT DE DATOS (Lista de Empleados)
+ */
+function doGet(e) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) return response({status: "error", message: "Servidor ocupado"});
+
+  try {
+    if (e.parameter.action === "getEmployees") {
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      const sheetConfig = ss.getSheetByName(HOJA_CONFIG);
+      if (!sheetConfig) return response({status: "error", message: "Falta hoja Config"});
+
+      const data = sheetConfig.getDataRange().getValues();
+      
+      // Filtramos empleados activos
+      const empleados = data.slice(1)
+        .filter(row => String(row[3]).toLowerCase() === "true")
+        .map(row => ({ id: row[0], name: row[1] }));
+
+      return response(empleados);
+    }
+    return response({status: "error", message: "Acción no válida"});
+  } catch (error) {
+    return response({status: "error", message: error.toString()});
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 2. PROCESAMIENTO DE REGISTROS (Entrada/Salida)
+ */
+function doPost(e) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    return response({status: "error", message: "Servidor ocupado."});
+  }
+
+  try {
+    const data = JSON.parse(e.postData.contents);
+    
+    if (data.token !== API_TOKEN) return response({status: "error", message: "Token Inválido"});
+
+    const cache = CacheService.getScriptCache();
+    if (data.uuid && cache.get(data.uuid)) {
+      return response({status: "success", message: "Duplicado ignorado", nombre: "Sistema"});
+    }
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheetConfig = ss.getSheetByName(HOJA_CONFIG);
+    const usuarios = sheetConfig.getDataRange().getValues();
+    
+    let empleado = usuarios.find(u => String(u[0]) === String(data.empleadoId) && String(u[2]) === String(data.pin));
+    const isActivo = empleado ? String(empleado[3]).toLowerCase() === "true" : false;
+
+    if (!empleado || !isActivo) {
+       return response({status: "error", message: "PIN Incorrecto o Usuario Inactivo"});
+    }
+
+    const sheetReg = ss.getSheetByName(HOJA_REGISTROS);
+    sheetReg.appendRow([
+      new Date(),                 
+      data.fechaLocal,            
+      data.empleadoId,
+      empleado[1],                
+      data.tipo,                  
+      data.dispositivo,
+      data.isOffline ? "OFFLINE" : "ONLINE",
+      data.uuid                   
+    ]);
+
+    if (data.uuid) cache.put(data.uuid, "true", 21600); // 6 horas de memoria caché
+
+    return response({status: "success", message: "Registro OK", nombre: empleado[1]});
+
+  } catch (error) {
+    return response({status: "error", message: error.toString()});
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function response(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+// ---------------------------------------------------------
+// LÓGICA DE NÓMINA (BLINDADA CONTRA ERRORES)
+// ---------------------------------------------------------
+
+function generarReporteNomina() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  const sheetReg = ss.getSheetByName(HOJA_REGISTROS);
+  if (!sheetReg) throw new Error("Falta la hoja 'Registros'");
+  
+  let outputSheet = ss.getSheetByName(HOJA_NOMINA);
+  if (!outputSheet) {
+    outputSheet = ss.insertSheet(HOJA_NOMINA);
+    outputSheet.appendRow(["Fecha Turno", "Semana", "ID", "Nombre", "Hora Entrada", "Hora Salida", "Horas Lab.", "Horas Break", "Estado / Alertas"]);
+    outputSheet.getRange(1, 1, 1, 9).setFontWeight("bold").setBackground("#ddeeff");
+  }
+
+  // Limpiar datos previos
+  if(outputSheet.getLastRow() > 1) {
+    outputSheet.getRange(2, 1, outputSheet.getLastRow() - 1, 9).clearContent();
+  }
+
+  const rawData = sheetReg.getDataRange().getValues();
+  let jornadas = {};
+
+  // --- PROCESAMIENTO ---
+  for (let i = 1; i < rawData.length; i++) {
+    let row = rawData[i];
+    
+    // 🛡️ BLINDAJE 1: Si la fila está vacía o no tiene fecha válida, la saltamos.
+    if (!row[0] || row[0] === "") continue;
+    
+    let fechaReal = new Date(row[0]);
+    // 🛡️ BLINDAJE 2: Si la fecha no es válida (es texto basura), la saltamos.
+    if (isNaN(fechaReal.getTime())) continue;
+
+    // Ajuste Jornada Nocturna
+    let fechaTurno = new Date(fechaReal);
+    if (fechaTurno.getHours() < 4) {
+      fechaTurno.setDate(fechaTurno.getDate() - 1);
+    }
+    
+    let fechaKey = fechaTurno.toLocaleDateString("es-CO");
+    let empId = row[2];
+    let empNombre = row[3];
+    let tipo = row[4];
+    let key = `${empId}|${fechaKey}`;
+
+    if (!jornadas[key]) {
+      jornadas[key] = { id: empId, nombre: empNombre, fecha: fechaTurno, marcas: [] };
+    }
+    jornadas[key].marcas.push({ hora: fechaReal, tipo: tipo });
+  }
+
+  let reporteFinal = [];
+
+  for (let key in jornadas) {
+    let j = jornadas[key];
+    j.marcas.sort((a, b) => a.hora - b.hora);
+
+    let tiempoTrabajadoMs = 0;
+    let horaEntrada = null;
+    let horaSalida = null;
+    let ultimoTipo = "SALIDA"; 
+    let marcaEntradaTemp = null;
+    let alertasSet = new Set(); 
+
+    for (let m of j.marcas) {
+      if (m.tipo === "ENTRADA") {
+        if (!horaEntrada) horaEntrada = m.hora; 
+        
+        if (ultimoTipo === "ENTRADA") {
+             alertasSet.add("⚠️ Falta Salida Intermedia");
+        }
+        marcaEntradaTemp = m.hora;
+        ultimoTipo = "ENTRADA";
+      
+      } else if (m.tipo === "SALIDA") {
+        horaSalida = m.hora; 
+        
+        if (ultimoTipo === "SALIDA") {
+           // Ignorar doble salida
+        } else if (marcaEntradaTemp) {
+          tiempoTrabajadoMs += (m.hora - marcaEntradaTemp);
+          ultimoTipo = "SALIDA";
+        }
+      }
+    }
+
+    if (ultimoTipo === "ENTRADA") alertasSet.add("⚠️ Jornada sin cerrar");
+
+    // Cálculos Matemáticos (Decimales para facilitar pago)
+    let horasTrabajadas = (tiempoTrabajadoMs / (1000 * 60 * 60));
+    
+    // Alerta de exceso
+    if (horasTrabajadas > 12) alertasSet.add("⚠️ >12 Horas");
+
+    // Cálculo Break
+    let breakHoras = 0;
+    if (horaEntrada && horaSalida && horasTrabajadas > 0) {
+        let spanTotal = (horaSalida - horaEntrada) / (1000 * 60 * 60);
+        breakHoras = spanTotal - horasTrabajadas;
+        if (breakHoras < 0) breakHoras = 0; 
+    }
+
+    // Estado del Break
+    let estado = "";
+    if (breakHoras > 0.1) {
+        if (breakHoras > 1.25) estado = "⚠️ DESC. EXCEDIDO";
+        else if (breakHoras < 0.75) estado = "⚠️ DESC. CORTO";
+        else estado = "✅ BREAK OK";
+    } else {
+        estado = "ℹ️ SIN BREAK";
+    }
+
+    let alertasTexto = Array.from(alertasSet).join(" | ");
+    let estadoFinal = alertasTexto ? `${alertasTexto}` : estado;
+
+    const options = { hour: '2-digit', minute: '2-digit', hour12: true };
+    const txtEntrada = horaEntrada ? horaEntrada.toLocaleTimeString("es-CO", options) : "--";
+    const txtSalida = horaSalida ? horaSalida.toLocaleTimeString("es-CO", options) : "--";
+
+    reporteFinal.push([
+      j.fecha,
+      getHeaderWeek(j.fecha), // Aquí llamamos a la función protegida
+      j.id,
+      j.nombre,
+      txtEntrada, 
+      txtSalida,  
+      horasTrabajadas.toFixed(2), // 2 decimales
+      breakHoras.toFixed(2),      // 2 decimales
+      estadoFinal
+    ]);
+  }
+
+  if (reporteFinal.length > 0) {
+    reporteFinal.sort((a,b) => a[0] - b[0] || a[3].localeCompare(b[3]));
+    outputSheet.getRange(2, 1, reporteFinal.length, 9).setValues(reporteFinal);
+  }
+}
+
+// 🛡️ BLINDAJE 3: Función auxiliar protegida contra fechas nulas
+function getHeaderWeek(d) {
+  // Si d no es una fecha válida, devolvemos un valor por defecto en vez de error
+  if (!d || !(d instanceof Date) || isNaN(d.getTime())) {
+    return "Semana --";
+  }
+
+  // Lógica original de semana ISO
+  d = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay()||7));
+  var yearStart = new Date(Date.UTC(d.getUTCFullYear(),0,1));
+  var weekNo = Math.ceil(( ( (d - yearStart) / 86400000) + 1)/7);
+  return "Semana " + weekNo;
+}
