@@ -1,5 +1,5 @@
 // --- CONFIGURACIÓN ---
-const API_TOKEN = "CANTON2026"; 
+const API_TOKEN = "CUSTOM_TOKEN"; 
 const HOJA_CONFIG = "Config";
 const HOJA_REGISTROS = "Registros";
 const HOJA_NOMINA = "Nomina_Diaria";
